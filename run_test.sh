@@ -28,17 +28,18 @@ OVERRIDE_WORKLOAD=""
 usage() {
 cat <<EOF
 Usage:
-  ./run_test.sh                   Run recoveries using existing backup + WAL
-  ./run_test.sh -i                Initialize primary + workload + recovery
-  ./run_test.sh -i --workload SQL Run full test with custom workload file
+  ./run_test.sh					Run recoveries using existing backup + WAL
+  ./run_test.sh -i				Initialize primary + workload + recovery
+  ./run_test.sh -i --workload	SQL Run full test with custom workload file
 
 Optional flags:
-  --workload PATH      Use custom pgbench script (applies only with -i)
-  --pipeline-on        Force pipeline=on (runs recovery once)
-  --pipeline-off       Force pipeline=off (runs recovery once)
-  --test-dir DIR       Override default test dir.
-  --pg-bin DIR       Override default postgresql bins
-  --help               Show help
+  --workload PATH      			Use custom pgbench script for cerating workload (applies only with -i)
+  --pgbench-builtin NAME		Use biultin (i.e. simple-update) pgbench script for creating a workload (applies only with -i)
+  --pipeline-on        			Force pipeline=on (runs recovery once)
+  --pipeline-off       			Force pipeline=off (runs recovery once)
+  --test-dir DIR       			Override default test dir.
+  --pg-bin DIR       			Override default postgresql bins
+  --help               			Show help
 
 Examples:
   ./run_test.sh -i
@@ -79,6 +80,15 @@ while [[ $# -gt 0 ]]; do
             shift 2
             ;;
 
+		--pgbench-builtin)
+			if [[ -z "$2" ]]; then
+				echo "ERROR: --pgbench-builtin requires a name"
+				exit 1
+			fi
+			PGBENCH_BUILTIN="$2"
+			shift 2
+			;;
+
         --pg-bin)
             if [[ -z "$2" ]]; then
                 echo "ERROR: --pg-bin requires a path"
@@ -116,11 +126,17 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
-if [[ -n "$OVERRIDE_WORKLOAD" && "$INIT_PRIMARY" -ne 1 ]]; then
-    echo "ERROR: --workload can only be used together with -i"
-    echo "Example:"
-    echo "  ./run_test.sh -i --workload sql/myload.sql"
-    exit 1
+# Workload validation
+if [[ $INIT_PRIMARY -eq 1 ]]; then
+    if [[ -n "$OVERRIDE_WORKLOAD" && -n "$PGBENCH_BUILTIN" ]]; then
+        echo "ERROR: Use either --workload or --pgbench-builtin, not both"
+        exit 1
+    fi
+else
+    if [[ -n "$OVERRIDE_WORKLOAD" || -n "$PGBENCH_BUILTIN" ]]; then
+        echo "ERROR: workloads can only be specified with -i"
+        exit 1
+    fi
 fi
 
 # Final workload selection
@@ -171,23 +187,25 @@ run_recovery_generic() {
 
 	chmod -R 700 "$RECOVERY"
 
+	cat config/recovery.conf >> "$RECOVERY/postgresql.conf"
 	cat >> "$RECOVERY/postgresql.conf" <<EOF
 
 # --- Recovery settings ---
 archive_mode = off
-enable_wal_pipeline = $PIPE
+wal_pipeline = $PIPE
 EOF
 
-	local start=$(date +%s)
+	# local start=$(date +%s)
 	echo "[+] Starting recovery..."
 
  	# perf record -F 999 -g -- $PGHOME/postgres -D "$RECOVERY"
-	$PGHOME/pg_ctl -D "$RECOVERY" start
+	$PGHOME/pg_ctl -D "$RECOVERY" -t 500 start
 
-	local end=$(date +%s)
-	echo ">>> Recovery finished in $((end-start)) seconds"
+	# local end=$(date +%s)
+	# echo ">>> Recovery finished in $((end-start)) seconds"
+	# echo ">>> $RECOVERY"
 
-	stop_existing_postgres
+	# stop_existing_postgres
 }
 
 
@@ -235,16 +253,39 @@ EOF
 	$PGHOME/pg_ctl -D "$PRIMARY" -l "$RESULTS/primary.log" start
 	sleep 2
 
-	echo "[+] Running DB init script"
+if [[ -n "$PGBENCH_BUILTIN" ]]; then
+	echo "[+] Running DB init: pgbench -i postgres"
+	$PGHOME/pgbench -i postgres
+else
+	echo "[+] Running DB init: $DB_INIT"
 	$PGHOME/psql postgres -f "$DB_INIT"
+fi
 
 	echo "[+] Taking base backup"
-	$PGHOME/pg_basebackup -D "$BACKUP" -X none -h localhost
+	$PGHOME/pg_basebackup -D "$BACKUP" -X none -h 127.0.0.1 -c fast -P
 
-	echo "[+] Running workload:"
-	echo "    $WORKLOAD_FILE"
-	$PGHOME/pgbench -n -c $CLIENTS -j $THREADS \
-		-T $WORKLOAD_DURATION -f "$WORKLOAD_FILE" postgres
+	if [[ -n "$PGBENCH_BUILTIN" ]]; then
+		echo "[+] Running built-in workload: $PGBENCH_BUILTIN"
+		echo "$PGHOME/pgbench -n -c "$CLIENTS" -j "$THREADS" -T "$WORKLOAD_DURATION" -b "$PGBENCH_BUILTIN" postgres"
+
+		$PGHOME/pgbench \
+			-n \
+			-c "$CLIENTS" \
+			-j "$THREADS" \
+			-T "$WORKLOAD_DURATION" \
+			-b "$PGBENCH_BUILTIN" \
+			postgres
+	else
+		echo "[+] Running custom workload: $WORKLOAD_FILE"
+		echo "$PGHOME/pgbench -n -c "$CLIENTS" -j "$THREADS" -T "$WORKLOAD_DURATION" -f "$WORKLOAD_FILE" postgres"
+		$PGHOME/pgbench \
+			-n \
+			-c "$CLIENTS" \
+			-j "$THREADS" \
+			-T "$WORKLOAD_DURATION" \
+			-f "$WORKLOAD_FILE" \
+			postgres
+	fi
 
 	echo "[!] Stopping primary"
 	$PGHOME/pg_ctl -D "$PRIMARY" stop
@@ -259,6 +300,7 @@ EOF
 ##############################################
 process_recovery_only() {
 	echo "== RECOVERY ONLY MODE =="
+	echo "[+] Running recoveries on previously created archives and backups. If you want to run new test workload use -i"
 
 	if [[ ! -d "$BACKUP" ]]; then
 		echo "ERROR: No backup found at $BACKUP"
