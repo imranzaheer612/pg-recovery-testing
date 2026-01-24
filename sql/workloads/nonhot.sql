@@ -5,6 +5,6 @@ BEGIN;
 -- Update the indexed column (PRIMARY KEY)
 UPDATE waltest
    SET id = id
- WHERE id BETWEEN :id AND :id + 50;
+WHERE id = :id;
 
 COMMIT;

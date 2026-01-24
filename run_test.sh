@@ -195,17 +195,15 @@ archive_mode = off
 wal_pipeline = $PIPE
 EOF
 
-	# local start=$(date +%s)
+	echo "[+] Additional confs for the recovery cluster:"
+	cat config/recovery.conf
+
 	echo "[+] Starting recovery..."
 
  	# perf record -F 999 -g -- $PGHOME/postgres -D "$RECOVERY"
-	$PGHOME/pg_ctl -D "$RECOVERY" -t 500 start
+	$PGHOME/pg_ctl -D "$RECOVERY" -t 9999999 start
 
-	# local end=$(date +%s)
-	# echo ">>> Recovery finished in $((end-start)) seconds"
-	# echo ">>> $RECOVERY"
-
-	# stop_existing_postgres
+	stop_existing_postgres
 }
 
 
@@ -242,6 +240,10 @@ process_full() {
 
 	echo "[+] Applying primary.conf"
 	cat config/primary.conf >> "$PRIMARY/postgresql.conf"
+
+	echo "[+] Additional confs for the primary cluster:"
+	cat config/primary.conf
+
 
 	cat >> "$PRIMARY/postgresql.conf" <<EOF
 wal_level = replica

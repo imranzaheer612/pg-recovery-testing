@@ -1,3 +1,6 @@
+\set id random(1, 5000000)
+
+
 BEGIN;
 
 UPDATE waltest
