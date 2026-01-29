@@ -20,6 +20,7 @@ RESULTS="$TEST_DIR/results"
 INIT_PRIMARY=0
 FORCE_PIPELINE=""
 OVERRIDE_WORKLOAD=""
+RUN_WORKLOAD_INIT_ONLY=""
 
 
 ##############################################
@@ -28,11 +29,12 @@ OVERRIDE_WORKLOAD=""
 usage() {
 cat <<EOF
 Usage:
-  ./run_test.sh					Run recoveries using existing backup + WAL
-  ./run_test.sh -i				Initialize primary + workload + recovery
-  ./run_test.sh -i --workload	SQL Run full test with custom workload file
+  ./run_test.sh				Run recoveries using existing backup + WAL
+  ./run_test.sh -i			Initialize the clusters before running recoveries.
+  ./run_test.sh -i --workload <path> 	Run recoveries with custom workload file
 
 Optional flags:
+  --init-only				Only init the clusters for recoveries.
   --workload PATH      			Use custom pgbench script for cerating workload (applies only with -i)
   --pgbench-builtin NAME		Use biultin (i.e. simple-update) pgbench script for creating a workload (applies only with -i)
   --pipeline-on        			Force pipeline=on (runs recovery once)
@@ -78,6 +80,11 @@ while [[ $# -gt 0 ]]; do
             fi
             OVERRIDE_WORKLOAD="$2"
             shift 2
+            ;;
+
+        --init-only)
+            RUN_WORKLOAD_INIT_ONLY="true"
+            shift
             ;;
 
 		--pgbench-builtin)
@@ -187,12 +194,21 @@ run_recovery_generic() {
 
 	chmod -R 700 "$RECOVERY"
 
+	# append user given configs
 	cat config/recovery.conf >> "$RECOVERY/postgresql.conf"
+
+	# append benchmarking configs if available
+	if [[ -f tmp-recovery.conf ]]; then
+	    cat tmp-recovery.conf >> "$RECOVERY/postgresql.conf"
+	fi
+
+	# append mandaotry configs
 	cat >> "$RECOVERY/postgresql.conf" <<EOF
 
 # --- Recovery settings ---
 archive_mode = off
 wal_pipeline = $PIPE
+log_min_messages = warning
 EOF
 
 	echo "[+] Additional confs for the recovery cluster:"
@@ -200,10 +216,25 @@ EOF
 
 	echo "[+] Starting recovery..."
 
- 	# perf record -F 999 -g -- $PGHOME/postgres -D "$RECOVERY"
-	$PGHOME/pg_ctl -D "$RECOVERY" -t 9999999 start
+	# perf record -F 999 -g -- $PGHOME/postgres -D "$RECOVERY"
+	# $PGHOME/pg_ctl -D "$RECOVERY" -t 9999999 start
+
+	# uncomment folowing when using with benchmark
+	perf record -F 999 -g -- "$PGHOME/postgres" -D "$RECOVERY" &
+	PG_PID=$!
+
+	echo "Postgres started (pid=$PG_PID), waiting until ready..."
+
+	# Wait until server is accepting connections
+	until "$PGHOME/pg_isready" -d postgres -q; do
+		sleep 2
+	done
+
+	# echo "Postgres is ready"
 
 	stop_existing_postgres
+
+	sleep 2		# need to wait for perf to exit
 }
 
 
@@ -257,11 +288,15 @@ EOF
 
 if [[ -n "$PGBENCH_BUILTIN" ]]; then
 	echo "[+] Running DB init: pgbench -i postgres"
-	$PGHOME/pgbench -i postgres
+	$PGHOME/pgbench -i -s 300 -F 90 postgres
 else
 	echo "[+] Running DB init: $DB_INIT"
 	$PGHOME/psql postgres -f "$DB_INIT"
 fi
+
+	echo "[+] Check DB size"
+	$PGHOME/psql postgres -c "SELECT pg_size_pretty(pg_database_size(current_database()));"
+
 
 	echo "[+] Taking base backup"
 	$PGHOME/pg_basebackup -D "$BACKUP" -X none -h 127.0.0.1 -c fast -P
@@ -291,6 +326,10 @@ fi
 
 	echo "[!] Stopping primary"
 	$PGHOME/pg_ctl -D "$PRIMARY" stop
+
+	if [[ "$RUN_WORKLOAD_INIT_ONLY" == "true" ]]; then
+		return
+	fi
 
 	echo "[+] Running recovery tests"
 	run_recovery_pair

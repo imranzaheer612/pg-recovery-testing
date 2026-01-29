@@ -1,17 +1,20 @@
 Testing PostgreSQL WAL recovery performance under different workloads. (wal_pipeline patch should be applied before using this)
 
 ```
-  ./run_test.sh                         # run recoveries with available backups
-  ./run_test.sh -i                      # Initialize primary + workload + run recoveries
-  ./run_test.sh -i --workload file.sql  # Run full test with custom workload file
+Usage:
+  ./run_test.sh							Run recoveries using existing backup + WAL
+  ./run_test.sh -i						Initialize the clusters before running recoveries.
+  ./run_test.sh -i --workload	<path> 	Run recoveries with custom workload file
 
 Optional flags:
-  --workload PATH      Use custom pgbench script (applies only with -i)
-  --pipeline-on        Force pipeline=on (runs recovery once)
-  --pipeline-off       Force pipeline=off (runs recovery once)
-  --test-dir DIR       Override default test dir.
-  --pg-bin DIR       Override default postgresql bins
-  --help               Show help
+  --init-only					Only init the clusters for recoveries.
+  --workload PATH      			Use custom pgbench script for cerating workload (applies only with -i)
+  --pgbench-builtin NAME		Use biultin (i.e. simple-update) pgbench script for creating a workload (applies only with -i)
+  --pipeline-on        			run pipeline=on (runs recovery once)
+  --pipeline-off       			run pipeline=off (runs recovery once)
+  --test-dir DIR       			Override default test dir.
+  --pg-bin DIR       			Override default postgresql bins
+  --help               			Show help
 
 Examples:
   ./run_test.sh -i
