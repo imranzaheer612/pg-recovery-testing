@@ -216,22 +216,23 @@ EOF
 
 	echo "[+] Starting recovery..."
 
-	# perf record -F 999 -g -- $PGHOME/postgres -D "$RECOVERY"
-	# $PGHOME/pg_ctl -D "$RECOVERY" -t 9999999 start
+	# while benchmarking we may need perf the `postgres` process
+	# so we have to implement waiting
+	if [[ "$BENCHMARKING" == "on" ]]; then
+		perf record -F 999 -g -- "$PGHOME/postgres" -D "$RECOVERY" &
+		PG_PID=$!
 
-	# uncomment folowing when using with benchmark
-	perf record -F 999 -g -- "$PGHOME/postgres" -D "$RECOVERY" &
-	PG_PID=$!
+		echo "Postgres started (pid=$PG_PID), waiting until ready..."
 
-	echo "Postgres started (pid=$PG_PID), waiting until ready..."
+		until "$PGHOME/pg_isready" -d postgres -q; do
+			sleep 2
+		done
+		return
+	else
+		$PGHOME/pg_ctl -D "$RECOVERY" -t 9999999 start
+	fi
 
-	# Wait until server is accepting connections
-	until "$PGHOME/pg_isready" -d postgres -q; do
-		sleep 2
-	done
-
-	# echo "Postgres is ready"
-
+	echo "Postgres is ready"
 	stop_existing_postgres
 
 	sleep 2		# need to wait for perf to exit
@@ -287,7 +288,7 @@ EOF
 	sleep 2
 
 if [[ -n "$PGBENCH_BUILTIN" ]]; then
-	echo "[+] Running DB init: pgbench -i postgres"
+	echo "[+] Running DB init: pgbench -i -s 300 -F 90 postgres"
 	$PGHOME/pgbench -i -s 300 -F 90 postgres
 else
 	echo "[+] Running DB init: $DB_INIT"
