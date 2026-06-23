@@ -12,6 +12,7 @@ BACKUP="$TEST_DIR/backup"
 RECOVERY="$TEST_DIR/recovery"
 ARCHIVE="$TEST_DIR/archive"
 RESULTS="$TEST_DIR/results"
+BENCH_PERF_DATA_DIR="$TEST_DIR/perfdata"
 
 
 ##############################################
@@ -216,18 +217,82 @@ EOF
 
 	echo "[+] Starting recovery..."
 
-	# while benchmarking we may need perf the `postgres` process
+	# while benchmarking we may need perf the target processes
 	# so we have to implement waiting
 	if [[ "$BENCHMARKING" == "on" ]]; then
-		perf record -F 999 -g -- "$PGHOME/postgres" -D "$RECOVERY" &
-		PG_PID=$!
+		mkdir -p "$BENCH_PERF_DATA_DIR"
+		"$PGHOME/postgres" -D "$RECOVERY" &
+		POSTMASTER_PID=$!
+		echo "Postmaster PID: $POSTMASTER_PID"
 
-		echo "Postgres started (pid=$PG_PID), waiting until ready..."
-
-		until "$PGHOME/pg_isready" -d postgres -q; do
-			sleep 2
+		#
+		# Wait for startup process
+		#
+		while true; do
+			STARTUP_PID=$(ps -eo pid,cmd | \
+				grep "startup recovering" | \
+				grep -v grep | \
+				awk '{print $1}')
+			[ -n "$STARTUP_PID" ] && break
+			sleep 0.1
 		done
-		return
+		echo "Startup PID: $STARTUP_PID"
+
+		#
+		# Wait for pipeline worker
+		#
+		PIPELINE_PID=""
+		if [[ "$FORCE_PIPELINE" == "on" ]]; then
+			while true; do
+				PIPELINE_PID=$(ps -eo pid,cmd | \
+					grep "wal pipeline producer" | \
+					grep -v grep | \
+					awk '{print $1}')
+				[[ -n "$PIPELINE_PID" ]] && break
+				sleep 0.1
+			done
+		fi
+		echo "Pipeline PID: $PIPELINE_PID"
+
+		#
+		# Start perf
+		#
+		perf record -F 999 -g -p "$STARTUP_PID" \
+			-o "$BENCH_PERF_DATA_DIR/startup-p-$FORCE_PIPELINE.data" &
+		STARTUP_PERF_PID=$!
+
+		PIPELINE_PERF_PID=""
+		if [[ -n "$PIPELINE_PID" ]]; then
+			perf record -F 999 -g -p "$PIPELINE_PID" \
+				-o "$BENCH_PERF_DATA_DIR/pipeline-p-$FORCE_PIPELINE.data" &
+			PIPELINE_PERF_PID=$!
+		fi
+
+		#
+		# Wait until recovery completes
+		#
+		until "$PGHOME/pg_isready" -d postgres -q; do
+			sleep 1
+		done
+		echo "Recovery complete"
+
+		#
+		# Stop perf — SIGINT lets perf flush its data cleanly
+		#
+		# kill -INT "$STARTUP_PERF_PID" 2>/dev/null
+		# [[ -n "$PIPELINE_PERF_PID" ]] && kill -INT "$PIPELINE_PERF_PID" 2>/dev/null
+
+		# wait "$STARTUP_PERF_PID" 2>/dev/null
+		# [[ -n "$PIPELINE_PERF_PID" ]] && wait "$PIPELINE_PERF_PID" 2>/dev/null
+
+		#
+		# Stop postgres — was never shut down in benchmarking path
+		#
+		echo "Stopping postgres after benchmarking run"
+		"$PGHOME/pg_ctl" -D "$RECOVERY" stop -m fast || \
+			kill -TERM "$POSTMASTER_PID" 2>/dev/null || true
+		wait "$POSTMASTER_PID" 2>/dev/null || true
+
 	else
 		$PGHOME/pg_ctl -D "$RECOVERY" -t 9999999 start
 	fi
@@ -288,8 +353,8 @@ EOF
 	sleep 2
 
 if [[ -n "$PGBENCH_BUILTIN" ]]; then
-	echo "[+] Running DB init: pgbench -i -s 300 -F 90 postgres"
-	$PGHOME/pgbench -i -s 300 -F 90 postgres
+	echo "[+] Running DB init: pgbench -i -s 300"
+	$PGHOME/pgbench -i -s 300 postgres
 else
 	echo "[+] Running DB init: $DB_INIT"
 	$PGHOME/psql postgres -f "$DB_INIT"
@@ -304,21 +369,23 @@ fi
 
 	if [[ -n "$PGBENCH_BUILTIN" ]]; then
 		echo "[+] Running built-in workload: $PGBENCH_BUILTIN"
-		echo "$PGHOME/pgbench -n -c "$CLIENTS" -j "$THREADS" -T "$WORKLOAD_DURATION" -b "$PGBENCH_BUILTIN" postgres"
+		echo "$PGHOME/pgbench -n -c "$CLIENTS" -M prepared -j "$THREADS" -T "$WORKLOAD_DURATION" -b "$PGBENCH_BUILTIN" postgres"
 
 		$PGHOME/pgbench \
 			-n \
 			-c "$CLIENTS" \
+			-M prepared \
 			-j "$THREADS" \
 			-T "$WORKLOAD_DURATION" \
 			-b "$PGBENCH_BUILTIN" \
 			postgres
 	else
 		echo "[+] Running custom workload: $WORKLOAD_FILE"
-		echo "$PGHOME/pgbench -n -c "$CLIENTS" -j "$THREADS" -T "$WORKLOAD_DURATION" -f "$WORKLOAD_FILE" postgres"
+		echo "$PGHOME/pgbench -n -c "$CLIENTS" -M prepared -j "$THREADS" -T "$WORKLOAD_DURATION" -f "$WORKLOAD_FILE" postgres"
 		$PGHOME/pgbench \
 			-n \
 			-c "$CLIENTS" \
+			-M prepared \
 			-j "$THREADS" \
 			-T "$WORKLOAD_DURATION" \
 			-f "$WORKLOAD_FILE" \

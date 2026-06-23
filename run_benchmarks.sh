@@ -17,6 +17,8 @@ LOG_DIR="$RESULTS_DIR/logs"
 PERF_DIR="$RESULTS_DIR/perf"
 CLUSTERS_INIT_DIR="$RESULTS_DIR/logs/init"
 SUMMARY_FILE="$RESULTS_DIR/summary.txt"
+BENCH_PERF_DATA_DIR="$TEST_DIR/perfdata"
+
 
 mkdir -p "$LOG_DIR" "$PERF_DIR" "$CLUSTERS_INIT_DIR"
 : > "$SUMMARY_FILE"
@@ -41,7 +43,7 @@ PGBENCH_WORKLOADS=(
 
 RECOVERIES_PER_TEST=1
 
-FLAMEGRAPH_DIR="/home/cybertec/work/installs/scripts/FlameGraph"
+FLAMEGRAPH_DIR="/home/imran/Desktop/work/tools/FlameGraph"
 STACKCOLLAPSE="$FLAMEGRAPH_DIR/stackcollapse-perf.pl"
 FLAMEGRAPH="$FLAMEGRAPH_DIR/flamegraph.pl"
 
@@ -81,7 +83,12 @@ parse_db_size() {
 
 generate_flamegraph() {
     local svg="$1"
-    perf script | "$STACKCOLLAPSE" | "$FLAMEGRAPH" > "$svg"
+    local perf_data_path="$2"
+    local svg_file_path="$PERF_DIR/$svg"
+
+    perf script -i "$perf_data_path" | "$STACKCOLLAPSE" | "$FLAMEGRAPH" > "$svg_file_path"
+
+    log "FlameGraph saved: $svg_file_path"
 }
 
 is_pgbench_builtin() {
@@ -136,12 +143,27 @@ run_recovery_test() {
     echo "  Initial DB size : $db_size"
     echo
 
-    local svg_file="${test_name}.svg"
-    local svg_file_path="$PERF_DIR/$svg_file"
-    generate_flamegraph "$svg_file_path"
-    log "FlameGraph saved: $svg_file_path"
+    local svg_file
+    local perf_data_file
 
-    echo "$test_name | ${elapsed}s | $pgbench_cmd | $db_size | $svg_file">> "$SUMMARY_FILE"
+
+    if [[ "$pipeline_mode" == "p0" ]]; then
+        svg_file="${test_name}-startup-proc.svg"
+        perf_data_file="${BENCH_PERF_DATA_DIR}/startup-p-off.data"
+        generate_flamegraph "$svg_file" "$perf_data_file"
+    else
+        svg_file="${test_name}-startup-proc.svg"
+        perf_data_file="${BENCH_PERF_DATA_DIR}/startup-p-on.data"
+        generate_flamegraph "$svg_file" "$perf_data_file"
+
+        svg_file="${test_name}-pipeline-proc.svg"
+        perf_data_file="${BENCH_PERF_DATA_DIR}/pipeline-p-on.data"
+        generate_flamegraph "$svg_file" "$perf_data_file"
+    fi
+
+
+    # echo "$test_name | ${elapsed}s | $pgbench_cmd | $db_size | $svg_file">> "$SUMMARY_FILE"
+    echo "$test_name | ${elapsed}s | $pgbench_cmd | $db_size ">> "$SUMMARY_FILE"
 }
 
 
@@ -176,6 +198,12 @@ run_workload() {
     ###########################################################################
     # DEFAULT CONFIG
     ###########################################################################
+    log "Applying def mem override"
+
+    cat >>"tmp-recovery.conf" <<EOF
+shared_buffers = 128MB
+maintenance_work_mem = 64MB
+EOF
     run_recovery_test "p0" "$workload" "def"
     run_recovery_test "p1" "$workload" "def"
 
@@ -186,6 +214,7 @@ run_workload() {
 
     cat >>"tmp-recovery.conf" <<EOF
 shared_buffers = 8GB
+maintenance_work_mem = 64MB
 EOF
 
     run_recovery_test "p0" "$workload" "sbuff"
@@ -195,16 +224,15 @@ EOF
     ###########################################################################
     # work_mem  OVERRIDE
     ###########################################################################
-    log "Applying shared_buffers override"
+#     log "Applying maintenance_work_mem override"
 
-    cat >>"tmp-recovery.conf" <<EOF
-shared_buffers = 8GB
-maintenance_work_mem = 1GB
-work_mem = 1GB
-EOF
+#     cat >>"tmp-recovery.conf" <<EOF
+# shared_buffers = 8GB
+# maintenance_work_mem = 1GB
+# EOF
 
-    run_recovery_test "p0" "$workload" "sbuff-m"
-    run_recovery_test "p1" "$workload" "sbuff-m"
+#     run_recovery_test "p0" "$workload" "sbuff-m"
+#     run_recovery_test "p1" "$workload" "sbuff-m"
 
     ###########################################################################
     # RESET FOR NEXT WORKLOAD
@@ -222,9 +250,9 @@ for workload in "${PGBENCH_WORKLOADS[@]}"; do
 done
 
 
-for workload in "${WORKLOADS[@]}"; do
-  run_workload "$workload"
-done
+# for workload in "${WORKLOADS[@]}"; do
+#   run_workload "$workload"
+# done
 
 ###############################################################################
 # Done

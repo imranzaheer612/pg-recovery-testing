@@ -35,4 +35,26 @@ Configurable:
 * You can pg conf for primary cluster `config/primary.conf`
 * You can pg conf for recovery cluster `config/recovery.conf`
 * You can add a new workload/init file or may edit the existing one.
+
+
 ```
+
+Examples
+
+Following will run pgbench workload and will arhive the wal logs. The a seperate
+command can be used to recover the database using the archived wal.
+
+```
+./run_test.sh -i --pgbench-builtin simple-update --init-only
+
+./run_test.sh --pipeline-on
+./run_test.sh --pipeline-off
+
+```
+
+To run the detailed benchmarking
+```
+./run_benchmarks.sh
+```
+
+Also remember to set `BENCHMARKING="on"` in env.conf when using above command.
