@@ -2,3 +2,5 @@
 *.tar.gz
 *.data
 *.data.old
+
+tmp-recovery.conf
