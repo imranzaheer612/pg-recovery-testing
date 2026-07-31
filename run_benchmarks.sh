@@ -195,6 +195,10 @@ run_workload() {
             --init-only >>"$init_cluster_file" 2>&1
     fi
 
+
+    # warmup run per initalization loop
+    run_recovery_test "p0" "$workload" "warmup"
+
     ###########################################################################
     # DEFAULT CONFIG
     ###########################################################################
@@ -202,8 +206,8 @@ run_workload() {
 
     cat >>"tmp-recovery.conf" <<EOF
 shared_buffers = 128MB
-maintenance_work_mem = 64MB
 EOF
+
     run_recovery_test "p0" "$workload" "def"
     run_recovery_test "p1" "$workload" "def"
 
@@ -214,7 +218,6 @@ EOF
 
     cat >>"tmp-recovery.conf" <<EOF
 shared_buffers = 8GB
-maintenance_work_mem = 64MB
 EOF
 
     run_recovery_test "p0" "$workload" "sbuff"
@@ -224,15 +227,32 @@ EOF
     ###########################################################################
     # work_mem  OVERRIDE
     ###########################################################################
-#     log "Applying maintenance_work_mem override"
+    log "Applying bgwritter override"
 
-#     cat >>"tmp-recovery.conf" <<EOF
-# shared_buffers = 8GB
-# maintenance_work_mem = 1GB
-# EOF
+    cat >>"tmp-recovery.conf" <<EOF
+shared_buffers = 8GB
+bgwriter_delay = 10ms
+bgwriter_lru_maxpages = 5000
+bgwriter_lru_multiplier = 10.0
+EOF
 
-#     run_recovery_test "p0" "$workload" "sbuff-m"
-#     run_recovery_test "p1" "$workload" "sbuff-m"
+    run_recovery_test "p0" "$workload" "sbuff-bgw"
+    run_recovery_test "p1" "$workload" "sbuff-bgw"
+
+    ###########################################################################
+    # work_mem  OVERRIDE
+    ###########################################################################
+    log "Applying bgwritter override"
+
+    cat >>"tmp-recovery.conf" <<EOF
+shared_buffers = 128MB
+bgwriter_delay = 10ms
+bgwriter_lru_maxpages = 5000
+bgwriter_lru_multiplier = 10.0
+EOF
+
+    run_recovery_test "p0" "$workload" "def-bgw"
+    run_recovery_test "p1" "$workload" "def-bgw"
 
     ###########################################################################
     # RESET FOR NEXT WORKLOAD

@@ -22,6 +22,7 @@ INIT_PRIMARY=0
 FORCE_PIPELINE=""
 OVERRIDE_WORKLOAD=""
 RUN_WORKLOAD_INIT_ONLY=""
+DO_ARCHIVE_RECOVERY=0
 
 
 ##############################################
@@ -42,6 +43,7 @@ Optional flags:
   --pipeline-off       			Force pipeline=off (runs recovery once)
   --test-dir DIR       			Override default test dir.
   --pg-bin DIR       			Override default postgresql bins
+  --archive						Forces an archive recoviery, otherwise crash recovery by default
   --help               			Show help
 
 Examples:
@@ -85,6 +87,11 @@ while [[ $# -gt 0 ]]; do
 
         --init-only)
             RUN_WORKLOAD_INIT_ONLY="true"
+            shift
+            ;;
+
+        --archive)
+            DO_ARCHIVE_RECOVERY=1
             shift
             ;;
 
@@ -210,10 +217,24 @@ run_recovery_generic() {
 archive_mode = off
 wal_pipeline = $PIPE
 log_min_messages = warning
+
 EOF
+
+	if [[ $DO_ARCHIVE_RECOVERY -eq 1 ]]; then
+		touch "$RECOVERY/recovery.signal"
+			cat >> "$RECOVERY/postgresql.conf" <<EOF
+restore_command = 'cp "$ARCHIVE/%f" %p'
+
+EOF
+	fi
 
 	echo "[+] Additional confs for the recovery cluster:"
 	cat config/recovery.conf
+
+	if [[ -f tmp-recovery.conf ]]; then
+		echo "[+] Additional confs for the recovery cluster (benchmarking):"
+		cat tmp-recovery.conf
+	fi
 
 	echo "[+] Starting recovery..."
 
@@ -272,18 +293,22 @@ EOF
 		# Wait until recovery completes
 		#
 		until "$PGHOME/pg_isready" -d postgres -q; do
-			sleep 1
+			sleep 4
 		done
 		echo "Recovery complete"
 
-		#
-		# Stop perf — SIGINT lets perf flush its data cleanly
-		#
-		# kill -INT "$STARTUP_PERF_PID" 2>/dev/null
-		# [[ -n "$PIPELINE_PERF_PID" ]] && kill -INT "$PIPELINE_PERF_PID" 2>/dev/null
+		# check bgwirtter stats
+		"$PGHOME/psql" -h 127.0.0.1 postgres \
+				-c "SELECT * FROM pg_stat_bgwriter;"
+		
+		"$PGHOME/psql" -h 127.0.0.1 postgres \
+				-c "SELECT * FROM pg_stat_io
+WHERE reads > 0
+   OR writes > 0
+   OR writebacks > 0
+   OR fsyncs > 0
+ORDER BY backend_type, object, context;"
 
-		# wait "$STARTUP_PERF_PID" 2>/dev/null
-		# [[ -n "$PIPELINE_PERF_PID" ]] && wait "$PIPELINE_PERF_PID" 2>/dev/null
 
 		#
 		# Stop postgres — was never shut down in benchmarking path
@@ -294,7 +319,18 @@ EOF
 		wait "$POSTMASTER_PID" 2>/dev/null || true
 
 	else
-		$PGHOME/pg_ctl -D "$RECOVERY" -t 9999999 start
+		
+		if [[ $DO_ARCHIVE_RECOVERY -eq 1 ]]; then
+			$PGHOME/pg_ctl -D "$RECOVERY" -t 9999999 start -l recoverylog
+			echo "[+] Waiting for recovery to fully complete (promotion)..."
+			until "$PGHOME/pg_controldata" "$RECOVERY" 2>/dev/null | grep -q "Database cluster state:.*in production"; do
+				sleep 0.2
+			done
+			echo "[+] Recovery complete, cluster promoted."
+		else
+			$PGHOME/pg_ctl -D "$RECOVERY" -t 9999999 start
+		fi
+
 	fi
 
 	echo "Postgres is ready"
