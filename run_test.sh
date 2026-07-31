@@ -215,7 +215,7 @@ run_recovery_generic() {
 
 # --- Recovery settings ---
 archive_mode = off
-wal_pipeline = $PIPE
+# wal_pipeline = $PIPE
 log_min_messages = warning
 
 EOF
