@@ -22,6 +22,7 @@ INIT_PRIMARY=0
 FORCE_PIPELINE=""
 OVERRIDE_WORKLOAD=""
 RUN_WORKLOAD_INIT_ONLY=""
+DO_CRASH_RECOVERY=0
 
 
 ##############################################
@@ -42,6 +43,7 @@ Optional flags:
   --pipeline-off       			Force pipeline=off (runs recovery once)
   --test-dir DIR       			Override default test dir.
   --pg-bin DIR       			Override default postgresql bins
+  --crash						Forces an crash recoviery, otherwise archive recovery by default
   --help               			Show help
 
 Examples:
@@ -85,6 +87,11 @@ while [[ $# -gt 0 ]]; do
 
         --init-only)
             RUN_WORKLOAD_INIT_ONLY="true"
+            shift
+            ;;
+
+        --crash)
+            DO_CRASH_RECOVERY=1
             shift
             ;;
 
@@ -151,10 +158,9 @@ fi
 WORKLOAD_FILE="${OVERRIDE_WORKLOAD:-$WORKLOAD}"
 
 
-
-##############################################
+#
 # STOP RUNNING POSTGRES (SAFELY)
-##############################################
+#
 stop_existing_postgres() {
 	echo "[+] Checking for any running PostgreSQL instances"
 
@@ -169,59 +175,11 @@ stop_existing_postgres() {
 	echo ""
 }
 
-
-##############################################
-# RUN RECOVERY (GENERIC)
-##############################################
-run_recovery_generic() {
-	local PIPE="$1"
-
-	mkdir -p "$RESULTS"
-
-	echo "================================"
-	echo "    RECOVERY (pipeline = $PIPE)"
-	echo "================================"
-
-	stop_existing_postgres
-
-	rm -rf "$RECOVERY"
-	mkdir -p "$RECOVERY/pg_wal"
-
-	echo "[+] Copying base backup"
-	cp -a "$BACKUP/." "$RECOVERY/"
-
-	echo "[+] Copying WAL archive"
-	cp -a "$ARCHIVE/." "$RECOVERY/pg_wal/"
-
-	chmod -R 700 "$RECOVERY"
-
-	# append user given configs
-	cat config/recovery.conf >> "$RECOVERY/postgresql.conf"
-
-	# append benchmarking configs if available
-	if [[ -f tmp-recovery.conf ]]; then
-	    cat tmp-recovery.conf >> "$RECOVERY/postgresql.conf"
-	fi
-
-	# append mandaotry configs
-	cat >> "$RECOVERY/postgresql.conf" <<EOF
-
-# --- Recovery settings ---
-archive_mode = off
-wal_pipeline = $PIPE
-log_min_messages = warning
-EOF
-
-	echo "[+] Additional confs for the recovery cluster:"
-	cat config/recovery.conf
-
-	echo "[+] Starting recovery..."
-
-	# while benchmarking we may need perf the target processes
-	# so we have to implement waiting
-	if [[ "$BENCHMARKING" == "on" ]]; then
-		mkdir -p "$BENCH_PERF_DATA_DIR"
+start_postgres_attach_perf()
+{
+	mkdir -p "$BENCH_PERF_DATA_DIR"
 		"$PGHOME/postgres" -D "$RECOVERY" &
+		# "$PGHOME/postgres" -D "$RECOVERY" >> recoverylog 2>&1 &
 		POSTMASTER_PID=$!
 		echo "Postmaster PID: $POSTMASTER_PID"
 
@@ -271,19 +229,13 @@ EOF
 		#
 		# Wait until recovery completes
 		#
-		until "$PGHOME/pg_isready" -d postgres -q; do
-			sleep 1
+		echo "[+] Waiting for recovery to fully complete"
+		until "$PGHOME/pg_controldata" "$RECOVERY" 2>/dev/null | grep -q "Database cluster state:.*in production"; do
+			sleep 2
 		done
-		echo "Recovery complete"
+		echo "[+] Recovery complete."
 
-		#
-		# Stop perf — SIGINT lets perf flush its data cleanly
-		#
-		# kill -INT "$STARTUP_PERF_PID" 2>/dev/null
-		# [[ -n "$PIPELINE_PERF_PID" ]] && kill -INT "$PIPELINE_PERF_PID" 2>/dev/null
-
-		# wait "$STARTUP_PERF_PID" 2>/dev/null
-		# [[ -n "$PIPELINE_PERF_PID" ]] && wait "$PIPELINE_PERF_PID" 2>/dev/null
+		print_stats
 
 		#
 		# Stop postgres — was never shut down in benchmarking path
@@ -292,9 +244,135 @@ EOF
 		"$PGHOME/pg_ctl" -D "$RECOVERY" stop -m fast || \
 			kill -TERM "$POSTMASTER_PID" 2>/dev/null || true
 		wait "$POSTMASTER_PID" 2>/dev/null || true
+}
 
+
+print_stats()
+{
+		# check bgwirttr stats
+		"$PGHOME/psql" -h 127.0.0.1 postgres \
+				-c "SELECT * FROM pg_stat_bgwriter;" || true
+		
+		# check pg_stat_io
+		"$PGHOME/psql" -h 127.0.0.1 postgres \
+				-c "SELECT * FROM pg_stat_io
+WHERE reads > 0
+   OR writes > 0
+   OR writebacks > 0
+   OR fsyncs > 0
+ORDER BY backend_type, object, context;" || true
+
+		# check pg_wait_sampling
+		"$PGHOME/psql" -h 127.0.0.1 postgres \
+				-c "create extension pg_wait_sampling;" || true
+		"$PGHOME/psql" -h 127.0.0.1 postgres \
+				-c "SELECT 
+    p.pid,
+    p.event_type,
+    p.event,
+    p.queryid,
+    p.count,
+    a.backend_type AS process_name,
+    a.usename AS username,
+    a.datname AS database_name
+FROM 
+    pg_wait_sampling_profile p
+LEFT JOIN 
+    pg_stat_activity a ON p.pid = a.pid
+ORDER BY 
+    p.event_type, 
+    p.count DESC;" || true
+}
+
+
+##############################################
+# RUN RECOVERY (GENERIC)
+##############################################
+run_recovery_generic() {
+	local PIPE="$1"
+
+	mkdir -p "$RESULTS"
+
+	echo "================================"
+	echo "    RECOVERY (pipeline = $PIPE)"
+	echo "================================"
+
+	stop_existing_postgres
+
+	rm -rf "$RECOVERY"
+	mkdir -p "$RECOVERY/pg_wal"
+
+	echo "[+] Copying base backup"
+	cp -a "$BACKUP/." "$RECOVERY/"
+
+	if [[ $DO_CRASH_RECOVERY -eq 1 ]]; then
+		echo "[+] Copying WAL archive"
+		cp -a "$ARCHIVE/." "$RECOVERY/pg_wal/"
+	fi
+
+	chmod -R 700 "$RECOVERY"
+
+	# append user given configs
+	cat config/recovery.conf >> "$RECOVERY/postgresql.conf"
+
+	# append benchmarking configs if available
+	if [[ -f tmp-recovery.conf ]]; then
+	    cat tmp-recovery.conf >> "$RECOVERY/postgresql.conf"
+	fi
+
+	# append mandaotry configs
+	cat >> "$RECOVERY/postgresql.conf" <<EOF
+
+# --- Recovery settings ---
+archive_mode = off
+wal_pipeline = $PIPE
+log_min_messages = warning
+
+EOF
+
+	# Only trigger archive recovery if configured
+	if [[ $DO_CRASH_RECOVERY -eq 0 ]]; then
+		touch "$RECOVERY/recovery.signal"
+			cat >> "$RECOVERY/postgresql.conf" <<EOF
+restore_command = 'cp "$ARCHIVE/%f" %p'
+
+EOF
+	fi
+
+	echo "[+] Additional confs for the recovery cluster:"
+	cat config/recovery.conf
+
+	if [[ -f tmp-recovery.conf ]]; then
+		echo "[+] Additional confs for the recovery cluster (benchmarking):"
+		cat tmp-recovery.conf
+	fi
+
+	# delete old cluster logs
+	rm -f recoverylog
+
+	echo "[+] Starting recovery..."
+
+	#
+	# while benchmarking we may need to perf the target processes
+	# so we have to implement waiting
+	#
+	if [[ "$PERF_PROFILING" == "on" ]]; then
+		start_postgres_attach_perf
 	else
-		$PGHOME/pg_ctl -D "$RECOVERY" -t 9999999 start
+		$PGHOME/pg_ctl -D "$RECOVERY" -t 9999999 start -l recoverylog
+		
+		# 
+		# In case of archive recovery we have to wait until all wal in replayed
+		# and should keep depending upon pg_ctl
+		#
+		if [[ $DO_CRASH_RECOVERY -eq 0 ]]; then
+			echo "[+] Waiting for recovery to fully complete (promotion)..."
+			until "$PGHOME/pg_controldata" "$RECOVERY" 2>/dev/null | grep -q "Database cluster state:.*in production"; do
+				sleep 1
+			done
+			echo "[+] Recovery complete, cluster promoted."
+		fi
+
 	fi
 
 	echo "Postgres is ready"
@@ -326,6 +404,8 @@ run_recovery_pair() {
 process_full() {
 	echo "== FULL TEST MODE =="
 
+	MY_COMMAND=""
+
 	stop_existing_postgres
 
 	echo "[+] Cleaning test directory"
@@ -353,8 +433,10 @@ EOF
 	sleep 2
 
 if [[ -n "$PGBENCH_BUILTIN" ]]; then
-	echo "[+] Running DB init: pgbench -i -s 300"
-	$PGHOME/pgbench -i -s 300 postgres
+	echo "[+] Running DB init: "
+	MY_COMMAND="$PGHOME/pgbench -i -s $SCALE_FACTOR -F $FILL_FACTOR  postgres"
+	echo "$MY_COMMAND"
+	eval "$MY_COMMAND"
 else
 	echo "[+] Running DB init: $DB_INIT"
 	$PGHOME/psql postgres -f "$DB_INIT"
@@ -369,27 +451,15 @@ fi
 
 	if [[ -n "$PGBENCH_BUILTIN" ]]; then
 		echo "[+] Running built-in workload: $PGBENCH_BUILTIN"
-		echo "$PGHOME/pgbench -n -c "$CLIENTS" -M prepared -j "$THREADS" -T "$WORKLOAD_DURATION" -b "$PGBENCH_BUILTIN" postgres"
+		MY_COMMAND="$PGHOME/pgbench -n -c "$CLIENTS" -M prepared -j "$THREADS" -T "$WORKLOAD_DURATION" -b "$PGBENCH_BUILTIN" postgres"
 
-		$PGHOME/pgbench \
-			-n \
-			-c "$CLIENTS" \
-			-M prepared \
-			-j "$THREADS" \
-			-T "$WORKLOAD_DURATION" \
-			-b "$PGBENCH_BUILTIN" \
-			postgres
+		echo "$MY_COMMAND"
+		eval "$MY_COMMAND"
 	else
 		echo "[+] Running custom workload: $WORKLOAD_FILE"
-		echo "$PGHOME/pgbench -n -c "$CLIENTS" -M prepared -j "$THREADS" -T "$WORKLOAD_DURATION" -f "$WORKLOAD_FILE" postgres"
-		$PGHOME/pgbench \
-			-n \
-			-c "$CLIENTS" \
-			-M prepared \
-			-j "$THREADS" \
-			-T "$WORKLOAD_DURATION" \
-			-f "$WORKLOAD_FILE" \
-			postgres
+		MY_COMMAND="$PGHOME/pgbench -n -c "$CLIENTS" -M prepared -j "$THREADS" -T "$WORKLOAD_DURATION" -f "$WORKLOAD_FILE" postgres"
+		echo "$MY_COMMAND"
+		eval "$MY_COMMAND"
 	fi
 
 	echo "[!] Stopping primary"

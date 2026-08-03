@@ -10,7 +10,7 @@ source config/env.conf
 # Directories
 ###############################################################################
 RECOVERY="$TEST_DIR/recovery"
-RESULTS="$TEST_DIR/results"
+RESULTS="$TEST_DIR/results-archive-rec"
 
 RESULTS_DIR="$RESULTS"
 LOG_DIR="$RESULTS_DIR/logs"
@@ -88,7 +88,7 @@ generate_flamegraph() {
 
     perf script -i "$perf_data_path" | "$STACKCOLLAPSE" | "$FLAMEGRAPH" > "$svg_file_path"
 
-    log "FlameGraph saved: $svg_file_path"
+    # log "FlameGraph saved: $svg_file_path"
 }
 
 is_pgbench_builtin() {
@@ -105,7 +105,7 @@ is_pgbench_builtin() {
 run_recovery_test() {
     local pipeline_mode="$1"   # p0 | p1
     local workload="$2"        # inserts.sql
-    local config_tag="$3"      # def | sbuff
+    local config_tag="$3"      # def | sbuff etc
 
     local workload_name="${workload%.sql}"
     local test_name="rec-${pipeline_mode}-${workload_name}-${config_tag}"
@@ -116,15 +116,14 @@ run_recovery_test() {
     log "Running test: $test_name"
     : > "$log_file"
 
-    for ((run=1; run<=RECOVERIES_PER_TEST; run++)); do
-        log "  Recovery $run/$RECOVERIES_PER_TEST"
+    # this will override profiling to on inside run_test.sh
+    export PERF_PROFILING="on"
 
-        if [[ "$pipeline_mode" == "p1" ]]; then
-            ./run_test.sh --pipeline-on >>"$log_file" 2>&1
-        else
-            ./run_test.sh --pipeline-off >>"$log_file" 2>&1
-        fi
-    done
+    if [[ "$pipeline_mode" == "p1" ]]; then
+        ./run_test.sh --pipeline-on $([[ -n "$PERFORM_CRASH_RECOVERIES" ]] && echo "--crash") >>"$log_file" 2>&1
+    else
+        ./run_test.sh --pipeline-off $([[ -n "$PERFORM_CRASH_RECOVERIES" ]] && echo "--crash") >>"$log_file" 2>&1
+    fi
 
     local elapsed
     elapsed="$(parse_elapsed_last "$log_file")"
@@ -166,17 +165,105 @@ run_recovery_test() {
     echo "$test_name | ${elapsed}s | $pgbench_cmd | $db_size ">> "$SUMMARY_FILE"
 }
 
+run_all_scenaiors() {
+    local workload="$1"
+
+    rm -f "tmp-recovery.conf"
+
+    # warmup run before actaul recoveries
+    run_recovery_test "p0" "$workload" "warmup"
+
+
+    #
+    # running as default configs
+    #
+    log "Applying def mem override"
+
+	rm -f "tmp-recovery.conf"
+    cat >>"tmp-recovery.conf" <<EOF
+shared_buffers = 128MB
+EOF
+
+    run_recovery_test "p0" "$workload" "def"
+    run_recovery_test "p1" "$workload" "def"
+
+    #
+    # using bigger shared buffers
+    #
+    log "Applying shared_buffers override"
+
+	rm "tmp-recovery.conf"
+    cat >>"tmp-recovery.conf" <<EOF
+shared_buffers = 8GB
+EOF
+
+    run_recovery_test "p0" "$workload" "sbuff"
+    run_recovery_test "p1" "$workload" "sbuff"
+
+
+    #
+    # using bigger buffers & aggresive bgwritter
+    #
+    log "Applying bgwritter override"
+
+	rm "tmp-recovery.conf"
+    cat >>"tmp-recovery.conf" <<EOF
+shared_buffers = 8GB
+bgwriter_delay = 10ms
+bgwriter_lru_maxpages = 5000
+bgwriter_lru_multiplier = 10.0
+EOF
+
+    run_recovery_test "p0" "$workload" "sbuff-bgw"
+    run_recovery_test "p1" "$workload" "sbuff-bgw"
+
+    #
+    # using default buffers but aggresive bgwritter
+    #
+    log "Applying bgwritter override"
+
+	rm "tmp-recovery.conf"
+    cat >>"tmp-recovery.conf" <<EOF
+shared_buffers = 128MB
+bgwriter_delay = 10ms
+bgwriter_lru_maxpages = 5000
+bgwriter_lru_multiplier = 10.0
+EOF
+
+    run_recovery_test "p0" "$workload" "def-bgw"
+    run_recovery_test "p1" "$workload" "def-bgw"
+
+    log "Resetting cluster state"
+	rm "tmp-recovery.conf"
+}
+
 
 run_workload() {
     local workload="$1"
 
+    #
+    # Make sure we are running archive recovery first
+    #
+    PERFORM_CRASH_RECOVERIES=""
+
+    RESULTS="$TEST_DIR/results-archive-rec"
+    RESULTS_DIR="$RESULTS"
+    LOG_DIR="$RESULTS_DIR/logs"
+    PERF_DIR="$RESULTS_DIR/perf"
+    CLUSTERS_INIT_DIR="$RESULTS_DIR/logs/init"
+    SUMMARY_FILE="$RESULTS_DIR/summary.txt"
+
+    mkdir -p "$LOG_DIR" "$PERF_DIR" "$CLUSTERS_INIT_DIR"
+    touch "$SUMMARY_FILE"
+
     log "============================================================"
     log "WORKLOAD: $workload"
+    log "<<<< ARCHIVE RECOVERY >>>>"
     log "============================================================"
 
-    ###########################################################################
-    # INIT ONCE PER WORKLOAD
-    ###########################################################################
+    #
+    # Initialize the workload and then run recoveries
+    #
     init_cluster_file="$CLUSTERS_INIT_DIR/workload_init_${workload}.log"
     rm -f "$init_cluster_file"
 
@@ -195,55 +282,36 @@ run_workload() {
             --init-only >>"$init_cluster_file" 2>&1
     fi
 
-    ###########################################################################
-    # DEFAULT CONFIG
-    ###########################################################################
-    log "Applying def mem override"
 
-    cat >>"tmp-recovery.conf" <<EOF
-shared_buffers = 128MB
-maintenance_work_mem = 64MB
-EOF
-    run_recovery_test "p0" "$workload" "def"
-    run_recovery_test "p1" "$workload" "def"
+    # uncomment following line to also run archive recovery
+    # run_all_scenaiors "$workload"
 
-    ###########################################################################
-    # shared_buffers OVERRIDE
-    ###########################################################################
-    log "Applying shared_buffers override"
+    #
+    # Now rerun as a crash recovery
+    #
 
-    cat >>"tmp-recovery.conf" <<EOF
-shared_buffers = 8GB
-maintenance_work_mem = 64MB
-EOF
+    log "============================================================"
+    log "WORKLOAD: $workload"
+    log "<<<< CRASH RECOVERY >>>>"
+    log "============================================================"
 
-    run_recovery_test "p0" "$workload" "sbuff"
-    run_recovery_test "p1" "$workload" "sbuff"
+    PERFORM_CRASH_RECOVERIES=1
 
+    RESULTS="$TEST_DIR/results-crash-rec"
+    RESULTS_DIR="$RESULTS"
+    LOG_DIR="$RESULTS_DIR/logs"
+    PERF_DIR="$RESULTS_DIR/perf"
+    CLUSTERS_INIT_DIR="$RESULTS_DIR/logs/init"
+    SUMMARY_FILE="$RESULTS_DIR/summary.txt"
 
-    ###########################################################################
-    # work_mem  OVERRIDE
-    ###########################################################################
-#     log "Applying maintenance_work_mem override"
+    mkdir -p "$LOG_DIR" "$PERF_DIR" "$CLUSTERS_INIT_DIR"
+    touch "$SUMMARY_FILE"
 
-#     cat >>"tmp-recovery.conf" <<EOF
-# shared_buffers = 8GB
-# maintenance_work_mem = 1GB
-# EOF
+    run_all_scenaiors "$workload"
 
-#     run_recovery_test "p0" "$workload" "sbuff-m"
-#     run_recovery_test "p1" "$workload" "sbuff-m"
-
-    ###########################################################################
-    # RESET FOR NEXT WORKLOAD
-    ###########################################################################
-    log "Resetting cluster state"
-	rm "tmp-recovery.conf"
-
-    # sed -i '/shared_buffers = 10GB/d' "$RECOVERY/postgresql.conf"
-    # ./run_test.sh --reset || true
 }
 
+PERFORM_CRASH_RECOVERIES=""
 
 for workload in "${PGBENCH_WORKLOADS[@]}"; do
     run_workload "$workload"

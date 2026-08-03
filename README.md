@@ -13,7 +13,8 @@ Optional flags:
   --pipeline-on        			run pipeline=on (runs recovery once)
   --pipeline-off       			run pipeline=off (runs recovery once)
   --test-dir DIR       			Override default test dir.
-  --pg-bin DIR       			Override default postgresql bins
+  --crash						        Forces an crash recoviery, otherwise archive recovery by default
+  --pg-bin DIR       			  Override default postgresql bins
   --help               			Show help
 
 Examples:
@@ -57,4 +58,4 @@ To run the detailed benchmarking
 ./run_benchmarks.sh
 ```
 
-Also remember to set `BENCHMARKING="on"` in env.conf when using above command.
+Also remember to set `PERF_PROFILING="on"` in env.conf when using above command.
