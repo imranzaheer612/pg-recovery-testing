@@ -12,17 +12,14 @@ BACKUP="$TEST_DIR/backup"
 RECOVERY="$TEST_DIR/recovery"
 ARCHIVE="$TEST_DIR/archive"
 RESULTS="$TEST_DIR/results"
-BENCH_PERF_DATA_DIR="$TEST_DIR/perfdata"
 
 
 ##############################################
 # RUNTIME OPTIONS
 ##############################################
 INIT_PRIMARY=0
-FORCE_PIPELINE=""
-OVERRIDE_WORKLOAD=""
 RUN_WORKLOAD_INIT_ONLY=""
-DO_CRASH_RECOVERY=0
+PGBENCH_BUILTIN="simple-update"
 
 
 ##############################################
@@ -37,19 +34,14 @@ Usage:
 
 Optional flags:
   --init-only				Only init the clusters for recoveries.
-  --workload PATH      			Use custom pgbench script for cerating workload (applies only with -i)
   --pgbench-builtin NAME		Use biultin (i.e. simple-update) pgbench script for creating a workload (applies only with -i)
-  --pipeline-on        			Force pipeline=on (runs recovery once)
-  --pipeline-off       			Force pipeline=off (runs recovery once)
   --test-dir DIR       			Override default test dir.
   --pg-bin DIR       			Override default postgresql bins
-  --crash						Forces an crash recoviery, otherwise archive recovery by default
   --help               			Show help
 
 Examples:
   ./run_test.sh -i
-  ./run_test.sh -i --workload sql/heavy_updates.sql
-  ./run_test.sh --pipeline-on
+  ./run_test.sh
 EOF
 exit 0
 }
@@ -66,32 +58,8 @@ while [[ $# -gt 0 ]]; do
             shift
             ;;
 
-        --pipeline-on)
-            FORCE_PIPELINE="on"
-            shift
-            ;;
-
-        --pipeline-off)
-            FORCE_PIPELINE="off"
-            shift
-            ;;
-
-        --workload)
-            if [[ -z "$2" ]]; then
-                echo "ERROR: --workload requires a file path"
-                exit 1
-            fi
-            OVERRIDE_WORKLOAD="$2"
-            shift 2
-            ;;
-
         --init-only)
             RUN_WORKLOAD_INIT_ONLY="true"
-            shift
-            ;;
-
-        --crash)
-            DO_CRASH_RECOVERY=1
             shift
             ;;
 
@@ -141,22 +109,6 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
-# Workload validation
-if [[ $INIT_PRIMARY -eq 1 ]]; then
-    if [[ -n "$OVERRIDE_WORKLOAD" && -n "$PGBENCH_BUILTIN" ]]; then
-        echo "ERROR: Use either --workload or --pgbench-builtin, not both"
-        exit 1
-    fi
-else
-    if [[ -n "$OVERRIDE_WORKLOAD" || -n "$PGBENCH_BUILTIN" ]]; then
-        echo "ERROR: workloads can only be specified with -i"
-        exit 1
-    fi
-fi
-
-# Final workload selection
-WORKLOAD_FILE="${OVERRIDE_WORKLOAD:-$WORKLOAD}"
-
 
 #
 # STOP RUNNING POSTGRES (SAFELY)
@@ -175,126 +127,16 @@ stop_existing_postgres() {
 	echo ""
 }
 
-start_postgres_attach_perf()
-{
-	mkdir -p "$BENCH_PERF_DATA_DIR"
-		"$PGHOME/postgres" -D "$RECOVERY" &
-		# "$PGHOME/postgres" -D "$RECOVERY" >> recoverylog 2>&1 &
-		POSTMASTER_PID=$!
-		echo "Postmaster PID: $POSTMASTER_PID"
-
-		#
-		# Wait for startup process
-		#
-		while true; do
-			STARTUP_PID=$(ps -eo pid,cmd | \
-				grep "startup recovering" | \
-				grep -v grep | \
-				awk '{print $1}')
-			[ -n "$STARTUP_PID" ] && break
-			sleep 0.1
-		done
-		echo "Startup PID: $STARTUP_PID"
-
-		#
-		# Wait for pipeline worker
-		#
-		PIPELINE_PID=""
-		if [[ "$FORCE_PIPELINE" == "on" ]]; then
-			while true; do
-				PIPELINE_PID=$(ps -eo pid,cmd | \
-					grep "wal pipeline producer" | \
-					grep -v grep | \
-					awk '{print $1}')
-				[[ -n "$PIPELINE_PID" ]] && break
-				sleep 0.1
-			done
-		fi
-		echo "Pipeline PID: $PIPELINE_PID"
-
-		#
-		# Start perf
-		#
-		perf record -F 999 -g -p "$STARTUP_PID" \
-			-o "$BENCH_PERF_DATA_DIR/startup-p-$FORCE_PIPELINE.data" &
-		STARTUP_PERF_PID=$!
-
-		PIPELINE_PERF_PID=""
-		if [[ -n "$PIPELINE_PID" ]]; then
-			perf record -F 999 -g -p "$PIPELINE_PID" \
-				-o "$BENCH_PERF_DATA_DIR/pipeline-p-$FORCE_PIPELINE.data" &
-			PIPELINE_PERF_PID=$!
-		fi
-
-		#
-		# Wait until recovery completes
-		#
-		echo "[+] Waiting for recovery to fully complete"
-		until "$PGHOME/pg_controldata" "$RECOVERY" 2>/dev/null | grep -q "Database cluster state:.*in production"; do
-			sleep 2
-		done
-		echo "[+] Recovery complete."
-
-		print_stats
-
-		#
-		# Stop postgres — was never shut down in benchmarking path
-		#
-		echo "Stopping postgres after benchmarking run"
-		"$PGHOME/pg_ctl" -D "$RECOVERY" stop -m fast || \
-			kill -TERM "$POSTMASTER_PID" 2>/dev/null || true
-		wait "$POSTMASTER_PID" 2>/dev/null || true
-}
-
-
-print_stats()
-{
-		# check bgwirttr stats
-		"$PGHOME/psql" -h 127.0.0.1 postgres \
-				-c "SELECT * FROM pg_stat_bgwriter;" || true
-		
-		# check pg_stat_io
-		"$PGHOME/psql" -h 127.0.0.1 postgres \
-				-c "SELECT * FROM pg_stat_io
-WHERE reads > 0
-   OR writes > 0
-   OR writebacks > 0
-   OR fsyncs > 0
-ORDER BY backend_type, object, context;" || true
-
-		# check pg_wait_sampling
-		"$PGHOME/psql" -h 127.0.0.1 postgres \
-				-c "create extension pg_wait_sampling;" || true
-		"$PGHOME/psql" -h 127.0.0.1 postgres \
-				-c "SELECT 
-    p.pid,
-    p.event_type,
-    p.event,
-    p.queryid,
-    p.count,
-    a.backend_type AS process_name,
-    a.usename AS username,
-    a.datname AS database_name
-FROM 
-    pg_wait_sampling_profile p
-LEFT JOIN 
-    pg_stat_activity a ON p.pid = a.pid
-ORDER BY 
-    p.event_type, 
-    p.count DESC;" || true
-}
-
 
 ##############################################
-# RUN RECOVERY (GENERIC)
+# RUN RECOVERY
 ##############################################
 run_recovery_generic() {
-	local PIPE="$1"
 
 	mkdir -p "$RESULTS"
 
 	echo "================================"
-	echo "    RECOVERY (pipeline = $PIPE)"
+	echo "    RECOVERY"
 	echo "================================"
 
 	stop_existing_postgres
@@ -305,75 +147,32 @@ run_recovery_generic() {
 	echo "[+] Copying base backup"
 	cp -a "$BACKUP/." "$RECOVERY/"
 
-	if [[ $DO_CRASH_RECOVERY -eq 1 ]]; then
-		echo "[+] Copying WAL archive"
-		cp -a "$ARCHIVE/." "$RECOVERY/pg_wal/"
-	fi
+	echo "[+] Copying WAL archive"
+	cp -a "$ARCHIVE/." "$RECOVERY/pg_wal/"
 
 	chmod -R 700 "$RECOVERY"
 
 	# append user given configs
 	cat config/recovery.conf >> "$RECOVERY/postgresql.conf"
 
-	# append benchmarking configs if available
-	if [[ -f tmp-recovery.conf ]]; then
-	    cat tmp-recovery.conf >> "$RECOVERY/postgresql.conf"
-	fi
-
 	# append mandaotry configs
 	cat >> "$RECOVERY/postgresql.conf" <<EOF
 
 # --- Recovery settings ---
 archive_mode = off
-wal_pipeline = $PIPE
-log_min_messages = warning
 
 EOF
-
-	# Only trigger archive recovery if configured
-	if [[ $DO_CRASH_RECOVERY -eq 0 ]]; then
-		touch "$RECOVERY/recovery.signal"
-			cat >> "$RECOVERY/postgresql.conf" <<EOF
-restore_command = 'cp "$ARCHIVE/%f" %p'
-
-EOF
-	fi
 
 	echo "[+] Additional confs for the recovery cluster:"
 	cat config/recovery.conf
 
-	if [[ -f tmp-recovery.conf ]]; then
-		echo "[+] Additional confs for the recovery cluster (benchmarking):"
-		cat tmp-recovery.conf
-	fi
 
 	# delete old cluster logs
 	rm -f recoverylog
 
 	echo "[+] Starting recovery..."
 
-	#
-	# while benchmarking we may need to perf the target processes
-	# so we have to implement waiting
-	#
-	if [[ "$PERF_PROFILING" == "on" ]]; then
-		start_postgres_attach_perf
-	else
-		$PGHOME/pg_ctl -D "$RECOVERY" -t 9999999 start -l recoverylog
-		
-		# 
-		# In case of archive recovery we have to wait until all wal in replayed
-		# and should keep depending upon pg_ctl
-		#
-		if [[ $DO_CRASH_RECOVERY -eq 0 ]]; then
-			echo "[+] Waiting for recovery to fully complete (promotion)..."
-			until "$PGHOME/pg_controldata" "$RECOVERY" 2>/dev/null | grep -q "Database cluster state:.*in production"; do
-				sleep 1
-			done
-			echo "[+] Recovery complete, cluster promoted."
-		fi
-
-	fi
+	$PGHOME/pg_ctl -D "$RECOVERY" -t 9999999 start -l recoverylog -o "'-p$PG_PORT'"
 
 	echo "Postgres is ready"
 	stop_existing_postgres
@@ -383,23 +182,14 @@ EOF
 
 
 run_recovery_pair() {
-	if [[ "$FORCE_PIPELINE" == "on" ]]; then
-		run_recovery_generic "on"
-		return
-	fi
-	if [[ "$FORCE_PIPELINE" == "off" ]]; then
-		run_recovery_generic "off"
-		return
-	fi
-
 	run_recovery_generic "off"
-	run_recovery_generic "on"
+	return
 }
 
 
 
 ##############################################
-# INIT PRIMARY + WORKLOAD + BACKUP
+# INIT PRIMARY + WORKLOAD + BACKUP + ARCHIVE
 ##############################################
 process_full() {
 	echo "== FULL TEST MODE =="
@@ -429,37 +219,34 @@ archive_command = 'cp %p "$ARCHIVE/%f"'
 EOF
 
 	echo "[+] Starting primary"
-	$PGHOME/pg_ctl -D "$PRIMARY" -l "$RESULTS/primary.log" start
+	$PGHOME/pg_ctl -D "$PRIMARY" -l "$RESULTS/primary.log" start -o "'-p$PG_PORT'"
 	sleep 2
 
 if [[ -n "$PGBENCH_BUILTIN" ]]; then
 	echo "[+] Running DB init: "
-	MY_COMMAND="$PGHOME/pgbench -i -s $SCALE_FACTOR -F $FILL_FACTOR  postgres"
+	MY_COMMAND="$PGHOME/pgbench -i -s $SCALE_FACTOR -F $FILL_FACTOR -p$PG_PORT postgres"
 	echo "$MY_COMMAND"
 	eval "$MY_COMMAND"
 else
 	echo "[+] Running DB init: $DB_INIT"
-	$PGHOME/psql postgres -f "$DB_INIT"
+	$PGHOME/psql postgres -f "$DB_INIT" -p$PG_PORT
 fi
 
 	echo "[+] Check DB size"
-	$PGHOME/psql postgres -c "SELECT pg_size_pretty(pg_database_size(current_database()));"
+	$PGHOME/psql postgres -p$PG_PORT -c "SELECT pg_size_pretty(pg_database_size(current_database()));"
 
 
 	echo "[+] Taking base backup"
-	$PGHOME/pg_basebackup -D "$BACKUP" -X none -h 127.0.0.1 -c fast -P
+	$PGHOME/pg_basebackup -p$PG_PORT -D "$BACKUP" -X none -h 127.0.0.1 -c fast -P
 
 	if [[ -n "$PGBENCH_BUILTIN" ]]; then
 		echo "[+] Running built-in workload: $PGBENCH_BUILTIN"
-		MY_COMMAND="$PGHOME/pgbench -n -c "$CLIENTS" -M prepared -j "$THREADS" -T "$WORKLOAD_DURATION" -b "$PGBENCH_BUILTIN" postgres"
+		MY_COMMAND="$PGHOME/pgbench -n -c "$CLIENTS" -M prepared -j "$THREADS" -T "$WORKLOAD_DURATION" -b "$PGBENCH_BUILTIN" -p$PG_PORT postgres"
 
 		echo "$MY_COMMAND"
 		eval "$MY_COMMAND"
 	else
-		echo "[+] Running custom workload: $WORKLOAD_FILE"
-		MY_COMMAND="$PGHOME/pgbench -n -c "$CLIENTS" -M prepared -j "$THREADS" -T "$WORKLOAD_DURATION" -f "$WORKLOAD_FILE" postgres"
-		echo "$MY_COMMAND"
-		eval "$MY_COMMAND"
+		echo "[+] Use --pgbench-builtin to specify workload to run"
 	fi
 
 	echo "[!] Stopping primary"
@@ -470,7 +257,7 @@ fi
 	fi
 
 	echo "[+] Running recovery tests"
-	run_recovery_pair
+	run_recovery_generic
 }
 
 
@@ -487,7 +274,7 @@ process_recovery_only() {
 		exit 1
 	fi
 
-	run_recovery_pair
+	run_recovery_generic
 }
 
 

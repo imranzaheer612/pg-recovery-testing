@@ -1,32 +1,24 @@
-Testing PostgreSQL WAL recovery performance under different workloads. (wal_pipeline patch should be applied before using this)
+Running PostgreSQL WAL recovery with different workloads.
 
 ```
 Usage:
-  ./run_test.sh							Run recoveries using existing backup + WAL
-  ./run_test.sh -i						Initialize the clusters before running recoveries.
-  ./run_test.sh -i --workload	<path> 	Run recoveries with custom workload file
+  ./run_test.sh							  Run recoveries using existing backup + acrhive
+  ./run_test.sh -i						Run new workload and create new archive before recovery.
 
 Optional flags:
-  --init-only					Only init the clusters for recoveries.
-  --workload PATH      			Use custom pgbench script for cerating workload (applies only with -i)
+  --init-only					      Only init the clusters for recoveries.
   --pgbench-builtin NAME		Use biultin (i.e. simple-update) pgbench script for creating a workload (applies only with -i)
-  --pipeline-on        			run pipeline=on (runs recovery once)
-  --pipeline-off       			run pipeline=off (runs recovery once)
   --test-dir DIR       			Override default test dir.
-  --crash						        Forces an crash recoviery, otherwise archive recovery by default
   --pg-bin DIR       			  Override default postgresql bins
   --help               			Show help
 
 Examples:
   ./run_test.sh -i
-  ./run_test.sh -i --workload sql/heavy_updates.sql
-  ./run_test.sh --pipeline-on
   ./run_test.sh --pg-bin "/home/user/pg18/bin" --test-dir "/tmp/wal-test"
 
 
 Defaults:
 
-    WORKLOAD="sql/workloads/updates.sql"
     PGHOME="/usr/lib/postgresql/18/bin"
     TEST_DIR="/tmp/pg_waltest"
 
@@ -42,20 +34,11 @@ Configurable:
 
 Examples
 
-Following will run pgbench workload and will arhive the wal logs. The a seperate
+Following will run pgbench workload and will archive the wal logs. The a seperate
 command can be used to recover the database using the archived wal.
 
 ```
 ./run_test.sh -i --pgbench-builtin simple-update --init-only
 
-./run_test.sh --pipeline-on
-./run_test.sh --pipeline-off
-
+./run_test.sh
 ```
-
-To run the detailed benchmarking
-```
-./run_benchmarks.sh
-```
-
-Also remember to set `PERF_PROFILING="on"` in env.conf when using above command.
