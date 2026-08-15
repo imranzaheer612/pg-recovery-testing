@@ -171,18 +171,19 @@ EOF
 	rm -f recoverylog
 
 	echo "[+] Starting recovery..."
+	echo "[!] Observe the recoverylog for a failing assertion."
 
 	$PGHOME/pg_ctl -D "$RECOVERY" -t 9999999 start -l recoverylog -o "'-p$PG_PORT'"
 
 	echo "Postgres is ready"
 	stop_existing_postgres
 
-	sleep 2		# need to wait for perf to exit
+	sleep 2
 }
 
 
 run_recovery_pair() {
-	run_recovery_generic "off"
+	run_recovery_generic
 	return
 }
 
